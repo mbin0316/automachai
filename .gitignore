@@ -1,0 +1,41 @@
+# ─── Dependencies ───────────────────────────────────────────────────────────
+node_modules/
+
+# ─── Build outputs ──────────────────────────────────────────────────────────
+dist/
+.next/
+out/
+*.tsbuildinfo
+
+# ─── Secrets — NEVER commit these ───────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+server/.env
+nextjs/.env
+nextjs/.env.local
+
+# ─── Local data (admin password hashes, OAuth tokens, etc.) ─────────────────
+server/data/admins.json
+server/data/clients.json
+server/data/tokens/
+
+# ─── Logs ───────────────────────────────────────────────────────────────────
+logs/
+server/logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── OS / editor ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ─── Misc ───────────────────────────────────────────────────────────────────
+.cache/
+coverage/

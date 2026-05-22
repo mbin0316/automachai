@@ -1,0 +1,95 @@
+# automachAI / FlowDesk — local Docker stack
+#
+# Usage:
+#   docker compose up -d         start everything
+#   docker compose logs -f api   tail one service's logs
+#   docker compose down          stop everything (data persists)
+#   docker compose down -v       stop + wipe DB/n8n volumes (fresh start)
+#
+# First-time setup: copy .env.example → .env at the project root and fill in
+# the secret values (RETELL_API_KEY, JWT_SECRET, GOOGLE_CLIENT_*, etc.).
+
+services:
+  # ── Postgres ────────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     flowdesk
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-flowdesk}
+      POSTGRES_DB:       flowdesk
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      # Auto-applied on first start when the data volume is empty.
+      - ./server/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "5432:5432"   # expose for local GUI tools (pgAdmin, DBeaver)
+    healthcheck:
+      test:     ["CMD-SHELL", "pg_isready -U flowdesk -d flowdesk"]
+      interval: 5s
+      timeout:  5s
+      retries:  10
+
+  # ── n8n (workflow automation) ───────────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    environment:
+      N8N_HOST:           localhost
+      N8N_PORT:           5678
+      N8N_PROTOCOL:       http
+      WEBHOOK_URL:        ${N8N_WEBHOOK_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE:   Asia/Kuala_Lumpur
+      TZ:                 Asia/Kuala_Lumpur
+      N8N_SECURE_COOKIE:  "false"   # required for http on localhost
+    volumes:
+      - n8n_data:/home/node/.n8n
+    ports:
+      - "5678:5678"
+
+  # ── Express API ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./server
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV:             production
+      PORT:                 4000
+
+      DATABASE_URL:         postgres://flowdesk:${DB_PASSWORD:-flowdesk}@db:5432/flowdesk
+      DATABASE_SSL:         "false"
+
+      JWT_SECRET:           ${JWT_SECRET}
+
+      RETELL_API_KEY:       ${RETELL_API_KEY}
+      RETELL_API_BASE:      ${RETELL_API_BASE:-https://api.retellai.com}
+
+      GOOGLE_CLIENT_ID:     ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_REDIRECT_URI:  ${GOOGLE_REDIRECT_URI:-http://localhost:4000/api/calendar/oauth/callback}
+      GOOGLE_CALENDAR_ID:   ${GOOGLE_CALENDAR_ID}
+
+      ALLOWED_ORIGINS:      ${ALLOWED_ORIGINS:-http://localhost:3000}
+    ports:
+      - "4000:4000"
+
+  # ── Next.js dashboard ───────────────────────────────────────────────────────
+  web:
+    build:
+      context: ./nextjs
+      args:
+        # Baked into the build because Next.js resolves rewrite destinations
+        # at build time, not runtime.
+        NEXT_PUBLIC_API_BASE: http://api:4000
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+
+volumes:
+  db_data:
+  n8n_data:

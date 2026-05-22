@@ -1,0 +1,47 @@
+{
+  "name": "flowdesk-server",
+  "version": "1.0.0",
+  "description": "FlowDesk backend — n8n + Retell AI SaaS proxy",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "dev": "tsx watch index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node tests/smoke.js",
+    "db:migrate-json": "tsx db/migrate-from-json.ts"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.3.1",
+    "express-session": "^1.18.0",
+    "google-auth-library": "^9.11.0",
+    "googleapis": "^140.0.1",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.10.0",
+    "node-fetch": "^3.3.2",
+    "pg": "^8.20.0",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/morgan": "^1.9.10",
+    "@types/node": "^25.9.0",
+    "@types/pg": "^8.20.0",
+    "nodemon": "^3.1.4",
+    "tsx": "^4.22.2",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
