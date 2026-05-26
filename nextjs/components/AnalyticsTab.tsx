@@ -14,17 +14,37 @@ const TOOL_COLORS: Record<string, string> = {
 const FALLBACK_COLORS = ["var(--text-muted)", "#334155", "#475569"];
 
 interface Analytics {
-  summary: { total: number; booked: number; missed: number; bookingRate: number; avgDurationFmt: string };
+  summary: {
+    total: number;
+    booked: number;       // actual Calendar events created
+    aiConfirmed?: number; // what the AI said — may exceed `booked` if n8n is failing
+    missed: number;
+    bookingRate: number;
+    avgDurationFmt: string;
+  };
   toolDistribution: { tool: string; count: number; pct: number }[];
   hourly: { hour: string; calls: number; booked: number; missed: number }[];
 }
 
+type Period = "today" | "week" | "month" | "year";
+
+const PERIOD_OPTIONS: { value: Period; label: string; suffix: string }[] = [
+  { value: "today", label: "24h",     suffix: "24h" },
+  { value: "week",  label: "7 days",  suffix: "7d"  },
+  { value: "month", label: "30 days", suffix: "30d" },
+  { value: "year",  label: "1 year",  suffix: "1y"  },
+];
+
 export default function AnalyticsTab({ client }: { client: Client }) {
-  const [today, setToday]   = useState<Analytics | null>(null);
-  const [weekly, setWeekly] = useState<Analytics | null>(null);
+  // Cards/summary respond to this selector. Charts have their own fixed ranges.
+  const [period, setPeriod] = useState<Period>("today");
+  const [summary, setSummary] = useState<Analytics | null>(null);
+  const [chart24h, setChart24h] = useState<Analytics | null>(null);
+  const [chart7d,  setChart7d]  = useState<Analytics | null>(null);
   const [calls,  setCalls]  = useState<Call[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // Initial load: charts (24h + 7d) + recent calls — fetched once per client.
   useEffect(() => {
     setLoading(true);
     Promise.all([
@@ -33,26 +53,42 @@ export default function AnalyticsTab({ client }: { client: Client }) {
       fetch(`/api/retell/calls?clientId=${client.id}&limit=5`).then(r => r.json()),
     ])
       .then(([t, w, c]) => {
-        setToday(t);
-        setWeekly(w);
+        setChart24h(t);
+        setChart7d(w);
         setCalls(c.calls || []);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [client.id]);
 
-  const s = today?.summary;
+  // Whenever the period changes, refetch the summary for that window.
+  useEffect(() => {
+    fetch(`/api/retell/analytics?clientId=${client.id}&period=${period}`)
+      .then(r => r.json())
+      .then(setSummary)
+      .catch(() => {});
+  }, [client.id, period]);
+
+  const s = summary?.summary;
+  const periodSuffix = PERIOD_OPTIONS.find(p => p.value === period)?.suffix ?? "24h";
+
+  // When the AI confirmed more bookings than actually landed in Calendar, surface
+  // the gap so it's obvious the n8n booking flow is dropping events.
+  const aiSaid    = s?.aiConfirmed ?? 0;
+  const inCal     = s?.booked ?? 0;
+  const gap       = Math.max(0, aiSaid - inCal);
+  const bookingsDelta = gap > 0 && s ? `${gap} not in Calendar` : "";
 
   const stats = [
-    { label: "Calls (24h)",       value: s ? String(s.total)           : "–", delta: "",     up: true,  icon: PhoneCall,   color: "var(--accent)" },
-    { label: "Bookings Made",     value: s ? String(s.booked)          : "–", delta: "",     up: true,  icon: CheckCircle, color: "#3b82f6" },
-    { label: "Booking Rate",      value: s ? `${s.bookingRate}%`       : "–", delta: "",     up: true,  icon: Activity,    color: "#a78bfa" },
-    { label: "Avg Call Duration", value: s ? s.avgDurationFmt          : "–", delta: "",     up: false, icon: Clock,       color: "#f59e0b" },
-    { label: "Missed / Failed",   value: s ? String(s.missed)          : "–", delta: "",     up: true,  icon: PhoneMissed, color: "#ef4444" },
-    { label: "Active Agent",      value: client.agentName || "–",              delta: "Live", up: true,  icon: Mic,         color: "var(--accent)" },
+    { label: `Calls (${periodSuffix})`,    value: s ? String(s.total)        : "–", delta: "",            up: true,  icon: PhoneCall,   color: "var(--accent)" },
+    { label: "Bookings Made",              value: s ? String(s.booked)       : "–", delta: bookingsDelta, up: false, icon: CheckCircle, color: "#3b82f6" },
+    { label: "Booking Rate",               value: s ? `${s.bookingRate}%`    : "–", delta: "",            up: true,  icon: Activity,    color: "#a78bfa" },
+    { label: "Avg Call Duration",          value: s ? s.avgDurationFmt       : "–", delta: "",            up: false, icon: Clock,       color: "#f59e0b" },
+    { label: "Missed / Failed",            value: s ? String(s.missed)       : "–", delta: "",            up: true,  icon: PhoneMissed, color: "#ef4444" },
+    { label: "Active Agent",               value: client.agentName || "–",          delta: "Live",        up: true,  icon: Mic,         color: "var(--accent)" },
   ];
 
-  const toolDist = (today?.toolDistribution || []).map((t, i) => ({
+  const toolDist = (chart24h?.toolDistribution || []).map((t, i) => ({
     name:  t.tool,
     value: t.pct,
     color: TOOL_COLORS[t.tool] || FALLBACK_COLORS[i % FALLBACK_COLORS.length],
@@ -66,27 +102,67 @@ export default function AnalyticsTab({ client }: { client: Client }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      {/* Stat grid */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 14 }}>
-        {stats.map(s => (
-          <div key={s.label} className="stat-card">
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-              <div>
-                <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginBottom: 8, fontWeight: 500 }}>{s.label}</div>
-                <div style={{ fontSize: 26, fontWeight: 700, fontFamily: "var(--font-display)", color: "var(--text-strong)", letterSpacing: "-0.5px" }}>{s.value}</div>
-              </div>
-              <div style={{ width: 34, height: 34, borderRadius: 8, background: s.color + "18", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <s.icon size={15} color={s.color} />
-              </div>
-            </div>
-            {s.delta && (
-              <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 4 }}>
-                {s.up ? <ArrowUpRight size={12} color="var(--accent)" /> : <ArrowDownRight size={12} color="#ef4444" />}
-                <span style={{ fontSize: 11, color: s.up ? "var(--accent)" : "#ef4444", fontWeight: 500 }}>{s.delta}</span>
-              </div>
-            )}
+      {/* Stat grid — wrapped in a parent card */}
+      <div className="stat-card" style={{ padding: "16px 18px" }}>
+        {/* Card header: title + period filter */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: "var(--text-muted-2)", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600 }}>
+            Key Metrics
           </div>
-        ))}
+          <div style={{ display: "flex", gap: 4, padding: 4, background: "var(--bg-base)", border: "1px solid var(--border)", borderRadius: 8 }}>
+            {PERIOD_OPTIONS.map(opt => {
+              const active = period === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  onClick={() => setPeriod(opt.value)}
+                  style={{
+                    padding: "5px 14px",
+                    background: active ? "var(--accent-dim)" : "transparent",
+                    color:      active ? "var(--accent)"     : "var(--text-muted-2)",
+                    border:     active ? "1px solid var(--accent-border)" : "1px solid transparent",
+                    borderRadius: 6,
+                    fontSize: 11.5,
+                    fontWeight: active ? 600 : 500,
+                    cursor: "pointer",
+                    transition: "all 0.12s",
+                  }}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12 }}>
+          {stats.map(s => (
+            <div
+              key={s.label}
+              style={{
+                background: "var(--bg-base)",
+                border: "1px solid var(--border)",
+                borderRadius: 10,
+                padding: "14px 16px",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginBottom: 8, fontWeight: 500 }}>{s.label}</div>
+                  <div style={{ fontSize: 26, fontWeight: 700, fontFamily: "var(--font-display)", color: "var(--text-strong)", letterSpacing: "-0.5px" }}>{s.value}</div>
+                </div>
+                <div style={{ width: 34, height: 34, borderRadius: 8, background: s.color + "18", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <s.icon size={15} color={s.color} />
+                </div>
+              </div>
+              {s.delta && (
+                <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 4 }}>
+                  {s.up ? <ArrowUpRight size={12} color="var(--accent)" /> : <ArrowDownRight size={12} color="#ef4444" />}
+                  <span style={{ fontSize: 11, color: s.up ? "var(--accent)" : "#ef4444", fontWeight: 500 }}>{s.delta}</span>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
       </div>
 
       {/* Charts */}
@@ -94,7 +170,7 @@ export default function AnalyticsTab({ client }: { client: Client }) {
         <div className="stat-card">
           <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 16 }}>Calls — Past 24 Hours</div>
           <ResponsiveContainer width="100%" height={180}>
-            <AreaChart data={today?.hourly || []} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
+            <AreaChart data={chart24h?.hourly || []} margin={{ top: 4, right: 4, left: -20, bottom: 0 }}>
               <defs>
                 <linearGradient id="gc1" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%"  stopColor="var(--accent)" stopOpacity={0.25} />
@@ -118,7 +194,7 @@ export default function AnalyticsTab({ client }: { client: Client }) {
         <div className="stat-card">
           <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 16 }}>Calls — Past 7 Days</div>
           <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={weekly?.hourly || []} margin={{ top: 4, right: 4, left: -20, bottom: 0 }} barSize={18}>
+            <BarChart data={chart7d?.hourly || []} margin={{ top: 4, right: 4, left: -20, bottom: 0 }} barSize={18}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
               <XAxis dataKey="hour"  tick={{ fill: "var(--text-dim)", fontSize: 10 }} axisLine={false} tickLine={false} />
               <YAxis tick={{ fill: "var(--text-dim)", fontSize: 10 }} axisLine={false} tickLine={false} />

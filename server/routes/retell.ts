@@ -3,14 +3,23 @@
  */
 
 import { Router, Request, Response, NextFunction } from 'express';
+import { google } from 'googleapis';
 import logger from '../config/logger';
 import * as clients from '../config/clients';
+import * as tokenStore from '../config/googleTokens';
 import { HttpError } from '../types';
 
 const router = Router();
 
 const RETELL_BASE = process.env.RETELL_API_BASE || 'https://api.retellai.com';
 const API_KEY     = process.env.RETELL_API_KEY  || '';
+
+// ── 5-minute in-memory cache for /analytics ─────────────────────────────────
+// Keyed by `${clientId}:${period}`. Each entry stores the serialised response
+// and the Unix timestamp when it was written. The TTL is intentionally short
+// so a period-selector change always feels live after one full cycle.
+const analyticsCache = new Map<string, { data: unknown; ts: number }>();
+const ANALYTICS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 // ── Types for Retell responses ───────────────────────────────────────────────
 interface RetellTranscriptTurn { role?: string; content?: string; words?: unknown[] }
@@ -59,6 +68,63 @@ interface RetellFetchOptions {
   method?:  string;
   body?:    string;
   headers?: Record<string, string>;
+}
+
+/**
+ * Count Google Calendar events for this client that were CREATED within the
+ * given time window. This is the truthful "Bookings Made" number — only
+ * counts appointments that actually landed in Calendar, not what the AI
+ * verbally promised.
+ *
+ * Returns 0 (with a warning log) if the client hasn't connected Google Calendar
+ * yet — we don't want analytics to fail hard for unconfigured clients.
+ */
+async function countActualBookings(
+  clientId: string,
+  windowStart: Date,
+  windowEnd: Date,
+): Promise<number> {
+  try {
+    const tokens = await tokenStore.load(clientId);
+    if (!tokens) return 0;
+
+    const client = await clients.get(clientId);
+    const calId  = client.google?.calendarId || process.env.GOOGLE_CALENDAR_ID;
+    if (!calId) return 0;
+
+    const auth = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      process.env.GOOGLE_REDIRECT_URI,
+    );
+    auth.setCredentials(tokens);
+    const cal = google.calendar({ version: 'v3', auth });
+
+    // updatedMin filters events whose mutation timestamp is after this point.
+    // Newly-created events qualify; updates do too. For booking-rate purposes
+    // that's fine — a re-scheduled appointment is still "a booking made today".
+    const resp = await cal.events.list({
+      calendarId:   calId,
+      updatedMin:   windowStart.toISOString(),
+      singleEvents: true,
+      maxResults:   250,
+      showDeleted:  false,
+    });
+
+    // Restrict to events whose `created` timestamp falls inside the window.
+    // (updatedMin alone would also catch old events that were merely edited.)
+    const items = resp.data.items || [];
+    const startMs = windowStart.getTime();
+    const endMs   = windowEnd.getTime();
+    return items.filter(ev => {
+      if (!ev.created) return false;
+      const t = new Date(ev.created).getTime();
+      return t >= startMs && t <= endMs && ev.status !== 'cancelled';
+    }).length;
+  } catch (err) {
+    logger.warn(`countActualBookings failed for ${clientId}: ${(err as Error).message}`);
+    return 0;
+  }
 }
 
 async function retellFetch(path: string, options: RetellFetchOptions = {}): Promise<unknown> {
@@ -225,12 +291,21 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
       return res.status(400).json({ error: true, message: 'clientId is required.' });
     }
 
+    // ── Cache check ────────────────────────────────────────────────────────
+    const cacheKey = `${clientId}:${period}`;
+    const cached = analyticsCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < ANALYTICS_CACHE_TTL) {
+      res.setHeader('X-Cache', 'HIT');
+      return res.json(cached.data);
+    }
+
     const now = new Date();
 
     // ── Time window for the Retell list-calls fetch ────────────────────────
-    // period=today => rolling 24 hours (NOT midnight-to-now)
-    // period=week  => rolling 7 days (last 7 calendar days, aligned to local midnight start of day -6)
-    // period=month => last 30 days
+    // period=today => rolling 24 hours
+    // period=week  => rolling 7 days
+    // period=month => rolling 30 days
+    // period=year  => rolling 365 days
     let windowStart: Date;
     if (period === 'week') {
       windowStart = new Date(now);
@@ -240,6 +315,10 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
       windowStart = new Date(now);
       windowStart.setDate(now.getDate() - 29);
       windowStart.setHours(0, 0, 0, 0);
+    } else if (period === 'year') {
+      windowStart = new Date(now);
+      windowStart.setDate(now.getDate() - 364);
+      windowStart.setHours(0, 0, 0, 0);
     } else {
       windowStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
     }
@@ -247,10 +326,13 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
     const client  = await clients.get(clientId);
     const agentId = client.retell?.agentId;
 
+    // Retell caps `limit` at 1000 per request. For a year-window with high
+    // traffic we may need pagination; for now request the max.
+    const fetchLimit = period === 'year' ? 1000 : period === 'month' ? 500 : 200;
     const data = await retellFetch('/v2/list-calls', {
       method: 'POST',
       body: JSON.stringify({
-        limit: 200,
+        limit: fetchLimit,
         filter_criteria: {
           ...(agentId && !agentId.startsWith('agent_REPLACE') ? { agent_id: [agentId] } : {}),
           start_timestamp: { lower_threshold: windowStart.getTime(), upper_threshold: now.getTime() },
@@ -262,8 +344,13 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
 
     const BOOKED_OUTCOMES = new Set(['book_appointment', 'booked', 'booking', 'appointment_booked', 'appointment_made']);
     const total   = calls.length;
-    const booked  = calls.filter((c) => BOOKED_OUTCOMES.has(c.tool) && c.status === 'completed').length;
-    const missed  = calls.filter((c) => c.status === 'missed').length;
+    // Two different ways to count bookings:
+    //   - aiConfirmed: what the AI agent verbally promised (Retell LLM classification).
+    //     Inflated when n8n fails — the agent still said "dah confirm".
+    //   - booked: actual Google Calendar events created in the window. Truthful.
+    const aiConfirmed = calls.filter((c) => BOOKED_OUTCOMES.has(c.tool) && c.status === 'completed').length;
+    const booked      = await countActualBookings(clientId, windowStart, now);
+    const missed      = calls.filter((c) => c.status === 'missed').length;
     const validDurations = calls.filter((c) => c.durationSec != null) as (NormalisedCall & { durationSec: number })[];
     const avgDurSec = validDurations.reduce((a, c) => a + c.durationSec, 0) / (validDurations.length || 1);
 
@@ -310,6 +397,19 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
           calls: 0, booked: 0, missed: 0,
         };
       });
+    } else if (period === 'year') {
+      // 12 monthly buckets ending with the current month
+      buckets = Array.from({ length: 12 }, (_, i) => {
+        const month = new Date(now.getFullYear(), now.getMonth() - 11 + i, 1);
+        const nextMonth = new Date(month.getFullYear(), month.getMonth() + 1, 1);
+        const isCurrent = i === 11;
+        return {
+          hour:   month.toLocaleDateString('en-MY', { month: 'short', year: '2-digit' }),
+          start:  month.getTime(),
+          end:    isCurrent ? now.getTime() : nextMonth.getTime(),
+          calls: 0, booked: 0, missed: 0,
+        };
+      });
     } else {
       // month or anything else: 30 daily buckets ending today
       buckets = Array.from({ length: 30 }, (_, i) => {
@@ -342,9 +442,12 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
     // Drop internal timestamps before returning.
     const hourly = buckets.map(({ hour, calls, booked, missed }) => ({ hour, calls, booked, missed }));
 
-    res.json({
+    const payload = {
       summary: {
-        total, booked, missed,
+        total,
+        booked,            // actual Calendar events created
+        aiConfirmed,       // what the AI said it booked (may exceed `booked` if n8n is failing)
+        missed,
         bookingRate:   total ? Math.round((booked / total) * 100) : 0,
         avgDurationSec: Math.round(avgDurSec),
         avgDurationFmt: `${Math.floor(avgDurSec / 60)}m ${Math.round(avgDurSec % 60)}s`,
@@ -355,7 +458,12 @@ router.get('/analytics', async (req: Request, res: Response, next: NextFunction)
       hourly,
       period,
       generatedAt: now.toISOString(),
-    });
+    };
+
+    // Store in cache, then respond.
+    analyticsCache.set(cacheKey, { data: payload, ts: Date.now() });
+    res.setHeader('X-Cache', 'MISS');
+    res.json(payload);
   } catch (err) { next(err); }
 });
 
